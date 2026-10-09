@@ -65,9 +65,18 @@ class PlexMediaPlayer(MediaPlayerEntity):
 
         Called automatically when the device calls push_update() or on reconnect.
         Reads fresh state from the device and pushes changes to the Remote.
+
+        Normally only changed attributes are sent, but on a state change everything is
+        re-sent. The remote drops an entity's artwork and media details while it is
+        unavailable (e.g. the integration disconnects while the remote is in standby), so
+        on waking it back to OFF the unchanged idle placeholder would otherwise never be
+        sent again and the screen stays blank.
         """
         attrs = self._device.get_media_player_attributes()
-        self.update(attrs)
+        state_changed = media_player.Attributes.STATE in self.filter_changed_attributes(
+            {media_player.Attributes.STATE: attrs.get(media_player.Attributes.STATE)}
+        )
+        self.update(attrs, force=state_changed)
 
     async def command_handler(
         self,
