@@ -47,6 +47,9 @@ PLAYER_STATE_TIMEOUT = 1.5
 # A playlist moving to its next item reports "stopped" and starts the next one within a
 # second or so; waiting this long before showing the idle image avoids a flash between items.
 IDLE_DELAY_SECONDS = 3.0
+# A newly started item can take a few seconds to appear in Plex's session list; how long
+# to keep looking for it (seconds between attempts) after a notification finds nothing.
+SESSION_RETRY_DELAYS = (1, 2, 3, 5, 8)
 
 
 class PlexServer(ExternalClientDevice):
@@ -579,27 +582,42 @@ class PlexServer(ExternalClientDevice):
     async def _fetch_session_details(
         self, payload: dict, identifier: str, revision: int
     ):
-        """Fetch full session details without blocking the event loop."""
+        """
+        Fetch full session details without blocking the event loop.
+
+        A new item's buffering/playing notifications can arrive before Plex lists its
+        session, and Plex sends nothing more until the next pause or stop. So a fetch that
+        finds no session is retried for a short while, until a newer notification takes
+        over, instead of leaving the remote without the item for the rest of playback.
+        """
         t0 = time.perf_counter()
         _LOG.debug("[%s] Fetching session details...", identifier)
         try:
-            # Run blocking Plex HTTP call in a thread pool executor
-            session = await self.event_loop.run_in_executor(
-                None,
-                self.get_session_by_client_id,
-                self.device_config.identifier,
-                payload,
-            )
+            session = None
+            for delay in (0, *SESSION_RETRY_DELAYS):
+                if delay:
+                    await asyncio.sleep(delay)
+                if revision != self._session_revision:
+                    return
+                # Run blocking Plex HTTP call in a thread pool executor
+                session = await self.event_loop.run_in_executor(
+                    None,
+                    self.get_session_by_client_id,
+                    self.device_config.identifier,
+                    payload,
+                )
 
-            if revision != self._session_revision:
-                return
-
-            if not session:
+                if revision != self._session_revision:
+                    return
+                if session:
+                    break
                 _LOG.debug(
                     "[%s] No session found (%.2fs)",
                     identifier,
                     time.perf_counter() - t0,
                 )
+
+            if not session:
                 return
 
             _LOG.debug(
