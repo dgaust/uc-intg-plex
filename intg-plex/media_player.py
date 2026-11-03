@@ -4,6 +4,7 @@ Media-player entity functions.
 :license: Mozilla Public License Version 2.0, see LICENSE for more details.
 """
 
+import asyncio
 import logging
 from typing import Any
 
@@ -23,6 +24,9 @@ from ucapi_framework import create_entity_id
 from ucapi_framework.entities import MediaPlayerEntity
 
 _LOG = logging.getLogger(__name__)
+
+# How long after a state change to send the media details again (seconds).
+STATE_CHANGE_RESEND_DELAY = 1.0
 
 
 class PlexMediaPlayer(MediaPlayerEntity):
@@ -56,6 +60,8 @@ class PlexMediaPlayer(MediaPlayerEntity):
             cmd_handler=self.command_handler,
         )
 
+        self._resend_task: asyncio.Task | None = None
+
         # Subscribe to device push updates — sync_state() is called on every push_update()
         self.subscribe_to_device(device)
 
@@ -71,12 +77,31 @@ class PlexMediaPlayer(MediaPlayerEntity):
         unavailable (e.g. the integration disconnects while the remote is in standby), so
         on waking it back to OFF the unchanged idle placeholder would otherwise never be
         sent again and the screen stays blank.
+
+        Sending it in the same message isn't enough either: coming back from unavailable,
+        the remote drops artwork that arrives together with the new state (the placeholder
+        sent on waking after a show had ended never appeared, while the one sent a few
+        seconds after a stop does). So everything is sent once more shortly afterwards.
         """
         attrs = self._device.get_media_player_attributes()
         state_changed = media_player.Attributes.STATE in self.filter_changed_attributes(
             {media_player.Attributes.STATE: attrs.get(media_player.Attributes.STATE)}
         )
         self.update(attrs, force=state_changed)
+        if state_changed:
+            if self._resend_task and not self._resend_task.done():
+                self._resend_task.cancel()
+            self._resend_task = asyncio.get_running_loop().create_task(self._resend_after_state_change())
+
+    async def _resend_after_state_change(self) -> None:
+        """Send the current attributes again once the remote has applied a state change."""
+        await asyncio.sleep(STATE_CHANGE_RESEND_DELAY)
+        attrs = self._device.get_media_player_attributes()
+        # A disconnect meanwhile marks the entity unavailable without going through
+        # sync_state; re-sending the device's state would undo that.
+        if self.attributes.get(media_player.Attributes.STATE) != attrs.get(media_player.Attributes.STATE):
+            return
+        self.update(attrs, force=True)
 
     async def command_handler(
         self,

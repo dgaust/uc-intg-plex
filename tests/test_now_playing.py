@@ -272,6 +272,7 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         entity = PlexMediaPlayer.__new__(PlexMediaPlayer)
         entity._device = server
         entity._entity_id = "test"
+        entity._resend_task = None
         entity.attributes = {}
         registry = Mock()
         registry.contains.return_value = True
@@ -299,6 +300,40 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     registry.update_attributes.call_args.args[1][Attrs.MEDIA_POSITION_UPDATED_AT], ""
                 )
+
+    async def test_state_change_resends_artwork_unless_unavailable_again(self):
+        server = device()
+        entity = PlexMediaPlayer.__new__(PlexMediaPlayer)
+        entity._device = server
+        entity._entity_id = "test"
+        entity._resend_task = None
+        entity.attributes = {Attrs.STATE: States.UNAVAILABLE}
+        registry = Mock()
+        registry.contains.return_value = True
+        registry.get.return_value = entity
+        registry.update_attributes.side_effect = lambda _entity_id, attrs: entity.attributes.update(attrs)
+        entity._api = SimpleNamespace(configured_entities=registry)
+
+        with patch("media_player.STATE_CHANGE_RESEND_DELAY", 0):
+            # Waking after a show ended: OFF and the placeholder, then both again.
+            server._attributes[Attrs.STATE] = States.OFF
+            server._set_idle_media()
+            await entity.sync_state()
+            self.assertEqual(registry.update_attributes.call_count, 1)
+            await entity._resend_task
+            self.assertEqual(registry.update_attributes.call_count, 2)
+            resent = registry.update_attributes.call_args.args[1]
+            self.assertEqual(resent[Attrs.STATE], States.OFF)
+            self.assertTrue(resent[Attrs.MEDIA_IMAGE_URL])
+
+            # Back in standby before the re-send: it must not undo UNAVAILABLE.
+            server._attributes[Attrs.STATE] = States.PLAYING
+            await entity.sync_state()
+            entity.attributes[Attrs.STATE] = States.UNAVAILABLE
+            calls = registry.update_attributes.call_count
+            await entity._resend_task
+            self.assertEqual(registry.update_attributes.call_count, calls)
+            self.assertEqual(entity.attributes[Attrs.STATE], States.UNAVAILABLE)
 
     async def test_position_events_do_not_starve_metadata_fetches(self):
         server = device()
