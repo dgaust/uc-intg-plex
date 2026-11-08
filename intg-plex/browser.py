@@ -6,17 +6,25 @@ Implements the UC Remote Two media browsing / searching API against a Plex serve
 Browse hierarchy:
   ROOT
   ├─ On Deck                          (media_type="on_deck")
+  ├─ Discover                         (media_type="hubs",           media_id="/hubs")
+  ├─ Up Next (while playing)          (media_type="hubs",           media_id=<postplay path>)
+  │   └─ Hub (a row of items)         (media_type="hub",            media_id=<path>#<hub id>)
+  ├─ Playlists                        (media_type="playlists")
+  │   └─ Playlist                     (media_type="playlist",       media_id=<rating_key>, can_play=True)
   └─ Libraries                        (media_type="library_root")
      ├─ Movies                         (media_type="movie_library", media_id=<section_key>)
      │   ├─ All Movies                 (media_type="movies",         media_id=<section_key>)
-     │   └─ Recently Added            (media_type="movies_recent",  media_id=<section_key>)
-     │       └─ Movie                 (can_play=True)
+     │   ├─ Recently Added            (media_type="movies_recent",  media_id=<section_key>)
+     │   │   └─ Movie                 (can_play=True)
+     │   └─ Collections               (media_type="collections",    media_id=<section_key>)
+     │       └─ Collection            (media_type="collection",     media_id=<rating_key>)
      ├─ TV Shows                       (media_type="show_library",   media_id=<section_key>)
      │   ├─ All Shows                  (media_type="shows",          media_id=<section_key>)
      │   └─ Recently Added            (media_type="shows_recent",   media_id=<section_key>)
      │       └─ Show                  (media_type="show",            media_id=<rating_key>)
-     │           └─ Season            (media_type="season",          media_id=<rating_key>)
-     │               └─ Episode       (can_play=True)
+     │           ├─ Season            (media_type="season",          media_id=<rating_key>)
+     │           │   └─ Episode       (can_play=True)
+     │           └─ More Like This    (media_type="hubs",            media_id=<related path>)
      └─ Music                          (media_type="music_library",  media_id=<section_key>)
          ├─ All Artists               (media_type="artists",        media_id=<section_key>)
          └─ Recently Added            (media_type="music_recent",   media_id=<section_key>)
@@ -30,7 +38,7 @@ Browse hierarchy:
 import logging
 from typing import TYPE_CHECKING
 
-from plexapi.library import LibrarySection, MovieSection, MusicSection, ShowSection
+from plexapi.library import Hub, LibrarySection, MovieSection, MusicSection, ShowSection
 from ucapi import (
     BrowseMediaItem,
     BrowseOptions,
@@ -56,6 +64,11 @@ _SECTION_TYPE_MAP = {
 
 # Default page size if not configured
 DEFAULT_PAGE_SIZE = 20
+
+# Where Plex lists its home rows ("hubs"), and what joins a hub's list to its identifier.
+HOME_HUBS_PATH = "/hubs"
+HUB_SEPARATOR = "#"
+UNPLAYABLE_HUB_TYPES = ("photo", "clip")
 
 
 def _pagination(
@@ -225,6 +238,23 @@ def _browse_sync(server, plex, media_id, media_type, page, limit) -> BrowseResul
     if media_type == "on_deck":
         return _browse_on_deck(server, plex, page, limit)
 
+    # ── Plex's rows: home (Discover), post-play (Up Next), related ──────────
+    if media_type == "hubs":
+        return _browse_hubs(plex, media_id)
+
+    if media_type == "hub":
+        return _browse_hub(server, plex, media_id, page, limit)
+
+    # ── Playlists and collections ───────────────────────────────────────────
+    if media_type == "playlists":
+        return _browse_playlists(server, plex, page, limit)
+
+    if media_type == "collections":
+        return _browse_collections(server, plex, media_id, page, limit)
+
+    if media_type in ("playlist", "collection"):
+        return _browse_container(server, plex, media_id, page, limit)
+
     # ── Library-level views ─────────────────────────────────────────────────
     if media_type in ("movie_library", "show_library", "music_library"):
         return _browse_library(server, plex, media_id, media_type)
@@ -354,8 +384,37 @@ def _browse_root(server, plex) -> BrowseResults:
             media_class=MediaClass.DIRECTORY,
             media_type="on_deck",
             can_browse=True,
-        )
+        ),
+        _make_item(
+            HOME_HUBS_PATH,
+            "Discover",
+            media_class=MediaClass.DIRECTORY,
+            media_type="hubs",
+            can_browse=True,
+        ),
     ]
+    # What Plex suggests after the item playing now (next episode, similar titles).
+    session = getattr(server, "_session", None)
+    rating_key = getattr(session, "ratingKey", None)
+    if rating_key and not getattr(session, "live", False):
+        children.append(
+            _make_item(
+                f"/hubs/metadata/{rating_key}/postplay",
+                "Up Next",
+                media_class=MediaClass.DIRECTORY,
+                media_type="hubs",
+                can_browse=True,
+            )
+        )
+    children.append(
+        _make_item(
+            "playlists",
+            "Playlists",
+            media_class=MediaClass.PLAYLIST,
+            media_type="playlists",
+            can_browse=True,
+        )
+    )
     for section in sections:
         mt = _SECTION_TYPE_MAP.get(section.type)
         if mt is None:
@@ -439,7 +498,16 @@ def _browse_library(server, plex, section_key: str, media_type: str) -> BrowseRe
             can_browse=True,
         )
 
+    sub_col = _make_item(
+        section_key,
+        "Collections",
+        media_type="collections",
+        media_class=MediaClass.DIRECTORY,
+        can_browse=True,
+    )
+
     thumb = _thumb_url(server, getattr(section, "thumb", None))
+    children = [sub_all, sub_rec, sub_col]
     parent = _make_item(
         section_key,
         section.title,
@@ -448,11 +516,11 @@ def _browse_library(server, plex, section_key: str, media_type: str) -> BrowseRe
         thumbnail=thumb,
         can_browse=True,
         can_search=True,
-        children=[sub_all, sub_rec],
+        children=children,
     )
     return BrowseResults(
         media=parent,
-        pagination=_pagination(2, 2, 1, 2),
+        pagination=_pagination(len(children), len(children), 1, len(children)),
     )
 
 
@@ -628,6 +696,15 @@ def _browse_seasons(server, plex, show_rating_key: str) -> BrowseResults:
         )
         for s in seasons
     ]
+    children.append(
+        _make_item(
+            f"/library/metadata/{show_rating_key}/related",
+            "More Like This",
+            media_class=MediaClass.DIRECTORY,
+            media_type="hubs",
+            can_browse=True,
+        )
+    )
     parent = _make_item(
         show_rating_key,
         show.title,
@@ -812,6 +889,129 @@ def _browse_tracks(server, plex, album_rating_key: str) -> BrowseResults:
     )
 
 
+def _hubs_title(path: str) -> str:
+    """Name a list of hubs after where it came from."""
+    if path == HOME_HUBS_PATH:
+        return "Discover"
+    if path.endswith("/postplay"):
+        return "Up Next"
+    return "More Like This"
+
+
+def _browse_hubs(plex, path: str) -> BrowseResults:
+    """
+    List Plex's rows (hubs) at a path as folders: the home screen, post-play or related.
+
+    A hub is addressed by the list it came from plus its identifier rather than by its
+    own key, because some hubs (post-play in particular) carry their items inline and
+    have no key of their own. Empty rows are left out, and so are rows of photos or
+    extras (trailers and the like), which can't be played from here.
+    """
+    hubs = [
+        hub
+        for hub in plex.fetchItems(path, cls=Hub)
+        if hub.size and hub.type not in UNPLAYABLE_HUB_TYPES
+    ]
+    children = [
+        _make_item(
+            f"{path}{HUB_SEPARATOR}{hub.hubIdentifier}",
+            hub.title,
+            media_class=MediaClass.DIRECTORY,
+            media_type="hub",
+            can_browse=True,
+        )
+        for hub in hubs
+    ]
+    parent = _make_item(
+        path,
+        _hubs_title(path),
+        media_class=MediaClass.DIRECTORY,
+        media_type="hubs",
+        can_browse=True,
+        children=children,
+    )
+    return BrowseResults(
+        media=parent,
+        pagination=_pagination(len(children), len(children), 1, len(children) or 1),
+    )
+
+
+def _browse_hub(server, plex, media_id: str, page: int, limit: int) -> BrowseResults:
+    """List the items in one of Plex's rows."""
+    path, _, identifier = media_id.rpartition(HUB_SEPARATOR)
+    hub = next(
+        (h for h in plex.fetchItems(path, cls=Hub) if h.hubIdentifier == identifier),
+        None,
+    )
+    return _item_list(
+        server,
+        media_id,
+        hub.title if hub else _hubs_title(path),
+        hub.items() if hub else [],
+        page,
+        limit,
+        media_type="hub",
+    )
+
+
+def _browse_playlists(server, plex, page: int, limit: int) -> BrowseResults:
+    return _item_list(
+        server, "playlists", "Playlists", plex.playlists(), page, limit,
+        media_type="playlists",
+    )
+
+
+def _browse_collections(
+    server, plex, section_key: str, page: int, limit: int
+) -> BrowseResults:
+    section: LibrarySection = plex.library.sectionByID(int(section_key))
+    return _item_list(
+        server, section_key, "Collections", section.collections(), page, limit,
+        media_type="collections",
+    )
+
+
+def _browse_container(
+    server, plex, rating_key: str, page: int, limit: int
+) -> BrowseResults:
+    """List what's in a playlist or a collection."""
+    container = plex.fetchItem(int(rating_key))
+    return _item_list(
+        server, rating_key, container.title, container.items(), page, limit,
+        media_type=getattr(container, "type", None),
+        thumbnail=_thumb_url(server, getattr(container, "thumb", None)),
+    )
+
+
+def _item_list(
+    server,
+    media_id: str,
+    title: str,
+    all_items: list,
+    page: int,
+    limit: int,
+    *,
+    media_type: str | None = None,
+    thumbnail: str | None = None,
+) -> BrowseResults:
+    """One page of mixed Plex items, each shown according to its own type."""
+    start = (page - 1) * limit
+    children = [_media_item(server, item) for item in all_items[start : start + limit]]
+    parent = _make_item(
+        media_id,
+        title,
+        media_class=MediaClass.DIRECTORY,
+        media_type=media_type,
+        can_browse=True,
+        thumbnail=thumbnail,
+        children=children,
+    )
+    return BrowseResults(
+        media=parent,
+        pagination=_pagination(len(children), len(all_items), page, limit),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Search
 # ---------------------------------------------------------------------------
@@ -840,29 +1040,7 @@ def _search_sync(
         raw = plex.library.search(title=query, maxresults=200)
 
     for item in raw:
-        media_class, item_media_type, can_play, can_browse = _classify_item(item)
-        thumb = _item_thumb(server, item)
-        subtitle = _search_subtitle(item, item_media_type)
-        results.append(
-            _make_item(
-                str(item.ratingKey),
-                item.title,
-                subtitle=subtitle,
-                media_class=media_class,
-                media_type=item_media_type,
-                can_play=can_play,
-                can_browse=can_browse,
-                thumbnail=thumb,
-                artist=getattr(item, "grandparentTitle", None)
-                or getattr(item, "parentTitle", None),
-                album=getattr(item, "parentTitle", None)
-                if item_media_type == "track"
-                else None,
-                duration=int(getattr(item, "duration", 0) / 1000)
-                if getattr(item, "duration", None)
-                else None,
-            )
-        )
+        results.append(_media_item(server, item))
 
     total = len(results)
     start = (page - 1) * limit
@@ -871,6 +1049,29 @@ def _search_sync(
     return SearchResults(
         media=page_results,
         pagination=_pagination(len(page_results), total, page, limit),
+    )
+
+
+def _media_item(server, item) -> BrowseMediaItem:
+    """Build a browse entry for any Plex item, from its own type."""
+    media_class, item_media_type, can_play, can_browse = _classify_item(item)
+    return _make_item(
+        str(item.ratingKey),
+        item.title,
+        subtitle=_search_subtitle(item, item_media_type),
+        media_class=media_class,
+        media_type=item_media_type,
+        can_play=can_play,
+        can_browse=can_browse,
+        thumbnail=_item_thumb(server, item),
+        artist=getattr(item, "grandparentTitle", None)
+        or getattr(item, "parentTitle", None),
+        album=getattr(item, "parentTitle", None)
+        if item_media_type == "track"
+        else None,
+        duration=int(getattr(item, "duration", 0) / 1000)
+        if getattr(item, "duration", None)
+        else None,
     )
 
 
@@ -892,8 +1093,13 @@ def _classify_item(item) -> tuple[str, str, bool, bool]:
             return "album", "album", False, True
         case "track":
             return "track", "track", True, False
+        case "playlist":
+            return "playlist", "playlist", True, True
+        case "collection":
+            return "directory", "collection", False, True
         case _:
-            return "directory", t or "directory", False, True
+            # Nothing to open it with (e.g. a photo or clip in a hub): show it, no more.
+            return "directory", t or "directory", False, False
 
 
 def _search_subtitle(item, media_type: str) -> str | None:
@@ -909,5 +1115,8 @@ def _search_subtitle(item, media_type: str) -> str | None:
         case "album":
             year = getattr(item, "year", None)
             return str(year) if year else None
+        case "playlist" | "collection":
+            count = getattr(item, "leafCount", None) or getattr(item, "childCount", None)
+            return f"{count} items" if count else None
         case _:
             return None

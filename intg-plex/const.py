@@ -71,10 +71,21 @@ PLEX_FEATURES = [
     Features.SEARCH_MEDIA,
     Features.PLAY_MEDIA_ACTION,
     Features.CLEAR_PLAYLIST,
+    Features.SUBTITLE,
+    Features.AUDIO_TRACK,
 ]
 
 
-PLEX_SIMPLE_COMMANDS = {}
+# Custom commands (shown on the remote as simple commands), acting on what's playing now.
+CMD_SUBTITLES_OFF = "SUBTITLES_OFF"
+CMD_MARK_WATCHED = "MARK_WATCHED"
+CMD_MARK_UNWATCHED = "MARK_UNWATCHED"
+
+PLEX_SIMPLE_COMMANDS = {
+    CMD_SUBTITLES_OFF: "Subtitles off",
+    CMD_MARK_WATCHED: "Mark watched",
+    CMD_MARK_UNWATCHED: "Mark unwatched",
+}
 
 PLEX_ACTIONS_KEYMAP = {}
 
@@ -104,6 +115,11 @@ PLEX_REMOTE_SIMPLE_COMMANDS = [
     Commands.NEXT,
     Commands.FAST_FORWARD,
     Commands.REWIND,
+    Commands.SUBTITLE,
+    Commands.AUDIO_TRACK,
+    CMD_SUBTITLES_OFF,
+    CMD_MARK_WATCHED,
+    CMD_MARK_UNWATCHED,
 ]
 
 PLEX_REMOTE_UI_PAGES: list[UiPage] = [  # type: ignore[assignment]

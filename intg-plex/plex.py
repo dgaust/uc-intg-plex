@@ -879,6 +879,91 @@ class PlexServer(ExternalClientDevice):
         _LOG.debug("[%s] Play/pause: player state %s -> %s (%s)", self.identifier, state, action.__name__, mtype)
         await self.event_loop.run_in_executor(None, lambda: action(mtype))
 
+    def _current_part(self):
+        """
+        Return the media part playing on this player now, or None.
+
+        Read fresh from the session list: the stream marked selected there is the one the
+        player is actually using, and the cached session predates any change made since.
+        Live TV is left out, as its streams can't be switched this way.
+        """
+        session = self.get_session_by_client_id(self.device_config.identifier)
+        if session is None or getattr(session, "live", False):
+            return None
+        media = getattr(session, "media", None) or []
+        parts = (getattr(media[0], "parts", None) or []) if media else []
+        return parts[0] if parts else None
+
+    async def async_cycle_subtitles(self, off: bool = False) -> None:
+        """
+        Switch to the next subtitle track, or off after the last one (or straight off).
+
+        The order is the item's own track order with "off" at the end, so repeated presses
+        go through every track and come back round to none.
+        """
+        def cycle() -> None:
+            client = self.client
+            part = self._current_part()
+            if client is None or part is None:
+                return
+            streams = part.subtitleStreams()
+            current = next((i for i, s in enumerate(streams) if s.selected), None)
+            if off or not streams:
+                target = None
+            elif current is None:
+                target = streams[0]
+            else:
+                target = streams[current + 1] if current + 1 < len(streams) else None
+            _LOG.info(
+                "[%s] Subtitles -> %s", self.identifier,
+                getattr(target, "extendedDisplayTitle", None) or getattr(target, "displayTitle", None) or "off",
+            )
+            # Plex treats subtitle stream 0 as "no subtitles".
+            client.setSubtitleStream(target.id if target else 0)
+
+        await self.event_loop.run_in_executor(None, cycle)
+
+    async def async_cycle_audio(self) -> None:
+        """Switch to the next audio track, wrapping round after the last one."""
+        def cycle() -> None:
+            client = self.client
+            part = self._current_part()
+            if client is None or part is None:
+                return
+            streams = part.audioStreams()
+            if len(streams) < 2:
+                return
+            current = next((i for i, s in enumerate(streams) if s.selected), -1)
+            target = streams[(current + 1) % len(streams)]
+            _LOG.info(
+                "[%s] Audio track -> %s", self.identifier,
+                getattr(target, "extendedDisplayTitle", None) or getattr(target, "displayTitle", None),
+            )
+            client.setAudioStream(target.id)
+
+        await self.event_loop.run_in_executor(None, cycle)
+
+    async def async_mark_watched(self, watched: bool) -> bool:
+        """
+        Mark the item playing on this player as watched or unwatched.
+
+        Returns False when there's nothing to mark: nothing playing, or Live TV (a guide
+        airing, not a library item).
+        """
+        def mark() -> bool:
+            session = self.get_session_by_client_id(self.device_config.identifier)
+            if session is None or getattr(session, "live", False) or not self._plex:
+                return False
+            item = self._plex.fetchItem(int(session.ratingKey))
+            if watched:
+                item.markPlayed()
+            else:
+                item.markUnplayed()
+            _LOG.info("[%s] Marked %s %s", self.identifier, item.title, "watched" if watched else "unwatched")
+            return True
+
+        return await self.event_loop.run_in_executor(None, mark)
+
     @property
     def device_config(self) -> PlexConfig:
         """Return device configuration."""

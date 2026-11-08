@@ -9,6 +9,9 @@ import logging
 from typing import Any
 
 from const import (
+    CMD_MARK_UNWATCHED,
+    CMD_MARK_WATCHED,
+    CMD_SUBTITLES_OFF,
     PLEX_REMOTE_BUTTONS_MAPPING,
     PLEX_REMOTE_SIMPLE_COMMANDS,
     PLEX_REMOTE_UI_PAGES,
@@ -155,6 +158,14 @@ class PlexRemote(RemoteEntity):
                 client.goBack()
             elif command == MediaPlayerCommands.CONTEXT_MENU:
                 client.contextMenu()
+            elif command == MediaPlayerCommands.SUBTITLE:
+                await self._device.async_cycle_subtitles()
+            elif command == CMD_SUBTITLES_OFF:
+                await self._device.async_cycle_subtitles(off=True)
+            elif command == MediaPlayerCommands.AUDIO_TRACK:
+                await self._device.async_cycle_audio()
+            elif command in (CMD_MARK_WATCHED, CMD_MARK_UNWATCHED):
+                await self._device.async_mark_watched(command == CMD_MARK_WATCHED)
             elif (
                 command == MediaPlayerCommands.FUNCTION_YELLOW
                 or command == MediaPlayerCommands.FUNCTION_GREEN

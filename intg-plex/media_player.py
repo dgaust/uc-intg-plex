@@ -9,7 +9,14 @@ import logging
 from typing import Any
 
 import browser as plex_browser
-from const import PLEX_FEATURES, PLEX_SIMPLE_COMMANDS, PlexConfig
+from const import (
+    CMD_MARK_UNWATCHED,
+    CMD_MARK_WATCHED,
+    CMD_SUBTITLES_OFF,
+    PLEX_FEATURES,
+    PLEX_SIMPLE_COMMANDS,
+    PlexConfig,
+)
 from plex import PlexServer
 from ucapi import (
     BrowseOptions,
@@ -168,6 +175,15 @@ class PlexMediaPlayer(MediaPlayerEntity):
                 client.goBack()
             elif cmd_id == Commands.CONTEXT_MENU:
                 client.contextMenu()
+            elif cmd_id == Commands.SUBTITLE:
+                await self._device.async_cycle_subtitles()
+            elif cmd_id == CMD_SUBTITLES_OFF:
+                await self._device.async_cycle_subtitles(off=True)
+            elif cmd_id == Commands.AUDIO_TRACK:
+                await self._device.async_cycle_audio()
+            elif cmd_id in (CMD_MARK_WATCHED, CMD_MARK_UNWATCHED):
+                if not await self._device.async_mark_watched(cmd_id == CMD_MARK_WATCHED):
+                    return StatusCodes.NOT_FOUND
             # elif cmd_id == Commands.CURSOR_ENTER:
             #     client.select()
             elif (
@@ -247,7 +263,12 @@ class PlexMediaPlayer(MediaPlayerEntity):
 
             def _play():
                 queue = plex.createPlayQueue(item)
-                client.playMedia(item, offset=0, playQueue=queue)
+                if getattr(item, "type", None) == "playlist":
+                    # Started from the queue, the player is sent the first item (not the
+                    # playlist's own key, which players don't play) along with the queue.
+                    client.playMedia(queue, offset=0)
+                else:
+                    client.playMedia(item, offset=0, playQueue=queue)
 
             await self._device.event_loop.run_in_executor(None, _play)
             _LOG.info(
