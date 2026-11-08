@@ -48,6 +48,17 @@ PLAYER_STATE_TIMEOUT = 1.5
 # A playlist moving to its next item reports "stopped" and starts the next one within a
 # second or so; waiting this long before showing the idle image avoids a flash between items.
 IDLE_DELAY_SECONDS = 3.0
+# Plex stream types, as in a part's streams.
+AUDIO_STREAM = 2
+SUBTITLE_STREAM = 3
+
+
+def track_label(stream, streams: list) -> str:
+    """Name a track for the log, with its position since several often share a title."""
+    title = getattr(stream, "extendedDisplayTitle", None) or getattr(stream, "displayTitle", None) or "track"
+    return f"{title} ({streams.index(stream) + 1} of {len(streams)})"
+
+
 # A newly started item can take a few seconds to appear in Plex's session list; how long
 # to keep looking for it (seconds between attempts) after a notification finds nothing.
 SESSION_RETRY_DELAYS = (1, 2, 3, 5, 8)
@@ -889,20 +900,32 @@ class PlexServer(ExternalClientDevice):
         _LOG.debug("[%s] Play/pause: player state %s -> %s (%s)", self.identifier, state, action.__name__, mtype)
         await self.event_loop.run_in_executor(None, lambda: action(mtype))
 
-    def _current_part(self):
+    def _current_tracks(self, stream_type: int) -> tuple[list, int | None] | None:
         """
-        Return the media part playing on this player now, or None.
+        Return the playing item's tracks of one kind and the index of the one in use.
 
-        Read fresh from the session list: the stream marked selected there is the one the
-        player is actually using, and the cached session predates any change made since.
-        Live TV is left out, as its streams can't be switched this way.
+        The session lists only the streams the player is using right now, so it can say
+        which track is on but not what else there is. The full list comes from the
+        library item (the part being played, if it has several versions). Returns None
+        while nothing is playing, and for Live TV, whose streams can't be switched this
+        way. The index is None when no track of that kind is in use (subtitles off).
         """
         session = self.get_session_by_client_id(self.device_config.identifier)
-        if session is None or getattr(session, "live", False):
+        if session is None or getattr(session, "live", False) or not self._plex:
             return None
         media = getattr(session, "media", None) or []
-        parts = (getattr(media[0], "parts", None) or []) if media else []
-        return parts[0] if parts else None
+        session_parts = (getattr(media[0], "parts", None) or []) if media else []
+        if not session_parts:
+            return None
+        in_use = {s.id for s in session_parts[0].streams if s.streamType == stream_type}
+        item = self._plex.fetchItem(int(session.ratingKey))
+        parts = [p for m in item.media for p in m.parts]
+        part = next((p for p in parts if p.id == session_parts[0].id), parts[0] if parts else None)
+        if part is None:
+            return None
+        streams = [s for s in part.streams if s.streamType == stream_type]
+        current = next((i for i, s in enumerate(streams) if s.id in in_use), None)
+        return streams, current
 
     async def async_cycle_subtitles(self, off: bool = False) -> None:
         """
@@ -913,21 +936,17 @@ class PlexServer(ExternalClientDevice):
         """
         def cycle() -> None:
             client = self.client
-            part = self._current_part()
-            if client is None or part is None:
+            tracks = None if off else self._current_tracks(SUBTITLE_STREAM)
+            if client is None or (tracks is None and not off):
                 return
-            streams = part.subtitleStreams()
-            current = next((i for i, s in enumerate(streams) if s.selected), None)
+            streams, current = tracks or ([], None)
             if off or not streams:
                 target = None
             elif current is None:
                 target = streams[0]
             else:
                 target = streams[current + 1] if current + 1 < len(streams) else None
-            _LOG.info(
-                "[%s] Subtitles -> %s", self.identifier,
-                getattr(target, "extendedDisplayTitle", None) or getattr(target, "displayTitle", None) or "off",
-            )
+            _LOG.info("[%s] Subtitles -> %s", self.identifier, track_label(target, streams) if target else "off")
             # Plex treats subtitle stream 0 as "no subtitles".
             client.setSubtitleStream(target.id if target else 0)
 
@@ -937,18 +956,12 @@ class PlexServer(ExternalClientDevice):
         """Switch to the next audio track, wrapping round after the last one."""
         def cycle() -> None:
             client = self.client
-            part = self._current_part()
-            if client is None or part is None:
+            tracks = self._current_tracks(AUDIO_STREAM)
+            if client is None or tracks is None or len(tracks[0]) < 2:
                 return
-            streams = part.audioStreams()
-            if len(streams) < 2:
-                return
-            current = next((i for i, s in enumerate(streams) if s.selected), -1)
-            target = streams[(current + 1) % len(streams)]
-            _LOG.info(
-                "[%s] Audio track -> %s", self.identifier,
-                getattr(target, "extendedDisplayTitle", None) or getattr(target, "displayTitle", None),
-            )
+            streams, current = tracks
+            target = streams[((current if current is not None else -1) + 1) % len(streams)]
+            _LOG.info("[%s] Audio track -> %s", self.identifier, track_label(target, streams))
             client.setAudioStream(target.id)
 
         await self.event_loop.run_in_executor(None, cycle)

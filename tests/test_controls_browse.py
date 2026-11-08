@@ -11,17 +11,27 @@ import browser
 from plexapi.library import Hub
 
 
-def stream(stream_id, selected=False):
-    return SimpleNamespace(id=stream_id, selected=selected, displayTitle=f"Track {stream_id}")
+def stream(stream_id, stream_type):
+    return SimpleNamespace(id=stream_id, streamType=stream_type, displayTitle="English")
 
 
-def session(subtitles=(), audio=(), live=False):
-    part = SimpleNamespace(
-        subtitleStreams=lambda: list(subtitles), audioStreams=lambda: list(audio)
+def session(subtitles=(), audio=(), sub_on=None, audio_on=None, live=False):
+    """
+    A playing item as Plex reports it: the session lists only the tracks in use, while
+    the library item (what fetchItem returns) has every track.
+    """
+    library = [stream(i, 3) for i in subtitles] + [stream(i, 2) for i in audio]
+    in_use = [s for s in library if s.id in (sub_on, audio_on)]
+    item = SimpleNamespace(
+        title="Film",
+        media=[SimpleNamespace(parts=[SimpleNamespace(id=1, streams=library)])],
+        markPlayed=Mock(),
+        markUnplayed=Mock(),
     )
-    return SimpleNamespace(
-        ratingKey=7, live=live, media=[SimpleNamespace(parts=[part])]
+    playing = SimpleNamespace(
+        ratingKey=7, live=live, media=[SimpleNamespace(parts=[SimpleNamespace(id=1, streams=in_use)])]
     )
+    return playing, item
 
 
 class StreamTests(unittest.IsolatedAsyncioTestCase):
@@ -31,33 +41,36 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
         self.client = Mock()
         self.server._plex_client = self.client
 
-    def playing(self, item):
-        self.server.get_session_by_client_id = lambda *_args: item
+    def playing(self, state):
+        current, item = state if state else (None, None)
+        self.server.get_session_by_client_id = lambda *_args: current
+        self.server._plex.fetchItem = Mock(return_value=item)
+        return item
 
     async def test_subtitles_go_through_every_track_then_off(self):
-        for selected, expected in ((None, 1), (0, 2), (1, 0)):
-            with self.subTest(selected=selected):
-                self.playing(session([stream(1, selected == 0), stream(2, selected == 1)]))
+        for on, expected in ((None, 1), (1, 2), (2, 0)):
+            with self.subTest(on=on):
+                self.playing(session([1, 2], sub_on=on))
                 await self.server.async_cycle_subtitles()
                 self.client.setSubtitleStream.assert_called_with(expected)
 
     async def test_subtitles_off(self):
-        self.playing(session([stream(1, True)]))
+        self.playing(session([1], sub_on=1))
         await self.server.async_cycle_subtitles(off=True)
         self.client.setSubtitleStream.assert_called_with(0)
 
     async def test_audio_wraps_round_and_needs_two_tracks(self):
-        self.playing(session(audio=[stream(5), stream(6, True)]))
+        self.playing(session(audio=[5, 6], audio_on=6))
         await self.server.async_cycle_audio()
         self.client.setAudioStream.assert_called_with(5)
         self.client.reset_mock()
-        self.playing(session(audio=[stream(5, True)]))
+        self.playing(session(audio=[5], audio_on=5))
         await self.server.async_cycle_audio()
         self.client.setAudioStream.assert_not_called()
 
     async def test_live_tv_and_nothing_playing_are_left_alone(self):
-        for item in (session([stream(1)], [stream(5), stream(6)], live=True), None):
-            self.playing(item)
+        for state in (session([1], [5, 6], audio_on=5, live=True), None):
+            self.playing(state)
             await self.server.async_cycle_subtitles()
             await self.server.async_cycle_audio()
             self.assertFalse(await self.server.async_mark_watched(True))
@@ -65,9 +78,7 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
         self.client.setAudioStream.assert_not_called()
 
     async def test_mark_watched_and_unwatched(self):
-        item = Mock(title="Film")
-        self.server._plex.fetchItem = Mock(return_value=item)
-        self.playing(session())
+        item = self.playing(session())
         self.assertTrue(await self.server.async_mark_watched(True))
         self.assertTrue(await self.server.async_mark_watched(False))
         self.server._plex.fetchItem.assert_called_with(7)
