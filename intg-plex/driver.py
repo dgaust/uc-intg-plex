@@ -11,6 +11,7 @@ import os
 from const import PlexConfig
 from media_player import PlexMediaPlayer
 from plex import PlexServer
+from sensor import PlexAudioTrackSensor, PlexSubtitleSensor
 from setup import PlexSetupFlow
 from ucapi_framework import BaseConfigManager, BaseIntegrationDriver, get_config_path
 
@@ -26,11 +27,12 @@ async def main():
     logging.getLogger("driver").setLevel(level)
     logging.getLogger("media_player").setLevel(level)
     logging.getLogger("plex").setLevel(level)
+    logging.getLogger("sensor").setLevel(level)
     logging.getLogger("setup_flow").setLevel(level)
 
     driver = BaseIntegrationDriver(
         device_class=PlexServer,
-        entity_classes=[PlexMediaPlayer],  # type: ignore[list-item]
+        entity_classes=[PlexMediaPlayer, PlexSubtitleSensor, PlexAudioTrackSensor],  # type: ignore[list-item]
         driver_id="plex_driver",
     )
 

@@ -53,10 +53,25 @@ AUDIO_STREAM = 2
 SUBTITLE_STREAM = 3
 
 
+# How long a player takes to switch tracks before the session shows the new one (seconds).
+TRACK_CHANGE_DELAY = 3.0
+
+
 def track_label(stream, streams: list) -> str:
-    """Name a track for the log, with its position since several often share a title."""
-    title = getattr(stream, "extendedDisplayTitle", None) or getattr(stream, "displayTitle", None) or "track"
-    return f"{title} ({streams.index(stream) + 1} of {len(streams)})"
+    """
+    Name a track, numbered when another track has the same name.
+
+    Files often carry two tracks with one name (e.g. plain and SDH English subtitles
+    both shown as "English"), and the number is then the only way to tell them apart.
+    """
+
+    def title(s) -> str:
+        return getattr(s, "extendedDisplayTitle", None) or getattr(s, "displayTitle", None) or "Track"
+
+    name = title(stream)
+    if sum(1 for s in streams if title(s) == name) > 1:
+        return f"{name} ({streams.index(stream) + 1} of {len(streams)})"
+    return name
 
 
 # A newly started item can take a few seconds to appear in Plex's session list; how long
@@ -98,6 +113,10 @@ class PlexServer(ExternalClientDevice):
         self._active_session_key: str | None = None
         self._session_revision = 0
         self._session_notification: tuple | None = None
+        # Names of the subtitle and audio tracks in use, for the track sensors.
+        self._track_labels: dict[int, str] = {}
+        # The playing item's full track lists: (rating key, part id, {stream type: streams}).
+        self._track_cache: tuple | None = None
         self._background_tasks: set[asyncio.Task] = set()
         self._listen_task: asyncio.Task | None = None
         self._connect_lock = asyncio.Lock()
@@ -327,6 +346,7 @@ class PlexServer(ExternalClientDevice):
         if revision != self._session_revision:
             return
         self._session = session
+        self._create_task(self._refresh_track_labels(session))
         elapsed = time.perf_counter() - t0
         if self._session:
             self._active_session_key = (
@@ -410,6 +430,7 @@ class PlexServer(ExternalClientDevice):
             }
         )
         self._session = None
+        self._track_labels = {}
 
     async def _show_idle_after_delay(self, revision: int) -> None:
         """Switch to the idle placeholder if nothing has started playing after a short wait."""
@@ -463,6 +484,7 @@ class PlexServer(ExternalClientDevice):
     def _reset_state(self):
         self._active_session_key = None
         self._session = None
+        self._track_labels = {}
         self._session_revision += 1
         self._session_notification = None
         # Reset state attributes to defaults
@@ -640,6 +662,7 @@ class PlexServer(ExternalClientDevice):
             )
 
             self._session = session
+            self._create_task(self._refresh_track_labels(session))
 
             media_type = media_content_type(session)
 
@@ -900,32 +923,82 @@ class PlexServer(ExternalClientDevice):
         _LOG.debug("[%s] Play/pause: player state %s -> %s (%s)", self.identifier, state, action.__name__, mtype)
         await self.event_loop.run_in_executor(None, lambda: action(mtype))
 
-    def _current_tracks(self, stream_type: int) -> tuple[list, int | None] | None:
+    def _current_tracks(self, stream_type: int, session=None) -> tuple[list, int | None] | None:
         """
         Return the playing item's tracks of one kind and the index of the one in use.
 
         The session lists only the streams the player is using right now, so it can say
         which track is on but not what else there is. The full list comes from the
-        library item (the part being played, if it has several versions). Returns None
-        while nothing is playing, and for Live TV, whose streams can't be switched this
-        way. The index is None when no track of that kind is in use (subtitles off).
+        library item (the part being played, if it has several versions), fetched once
+        per item. Returns None while nothing is playing, and for Live TV, whose streams
+        can't be switched this way. The index is None when no track of that kind is in
+        use (subtitles off).
+
+        Without a session given, the player's session is read fresh, so a change just
+        made is seen.
         """
-        session = self.get_session_by_client_id(self.device_config.identifier)
+        if session is None:
+            session = self.get_session_by_client_id(self.device_config.identifier)
         if session is None or getattr(session, "live", False) or not self._plex:
             return None
         media = getattr(session, "media", None) or []
         session_parts = (getattr(media[0], "parts", None) or []) if media else []
         if not session_parts:
             return None
-        in_use = {s.id for s in session_parts[0].streams if s.streamType == stream_type}
-        item = self._plex.fetchItem(int(session.ratingKey))
-        parts = [p for m in item.media for p in m.parts]
-        part = next((p for p in parts if p.id == session_parts[0].id), parts[0] if parts else None)
-        if part is None:
-            return None
-        streams = [s for s in part.streams if s.streamType == stream_type]
+        session_part = session_parts[0]
+        key = (session.ratingKey, session_part.id)
+        if self._track_cache is None or self._track_cache[:2] != key:
+            item = self._plex.fetchItem(int(session.ratingKey))
+            parts = [p for m in item.media for p in m.parts]
+            part = next((p for p in parts if p.id == session_part.id), parts[0] if parts else None)
+            by_type: dict[int, list] = {}
+            for stream in getattr(part, "streams", None) or []:
+                by_type.setdefault(stream.streamType, []).append(stream)
+            self._track_cache = (*key, by_type)
+        streams = self._track_cache[2].get(stream_type, [])
+        in_use = {s.id for s in session_part.streams if s.streamType == stream_type}
         current = next((i for i, s in enumerate(streams) if s.id in in_use), None)
         return streams, current
+
+    def _read_track_labels(self, session) -> dict[int, str]:
+        """Name the subtitle and audio tracks in use in a session ("Off" for no subtitles)."""
+        labels = {}
+        for stream_type in (SUBTITLE_STREAM, AUDIO_STREAM):
+            try:
+                tracks = self._current_tracks(stream_type, session)
+            except Exception as ex:  # pylint: disable=broad-exception-caught
+                _LOG.debug("[%s] Couldn't read tracks: %s", self.identifier, ex)
+                tracks = None
+            if tracks is None:
+                continue
+            streams, current = tracks
+            if current is not None:
+                labels[stream_type] = track_label(streams[current], streams)
+            elif stream_type == SUBTITLE_STREAM:
+                labels[stream_type] = "Off"
+        return labels
+
+    async def _refresh_track_labels(self, session=None) -> None:
+        """Re-read which tracks are in use and tell the sensors if that changed."""
+        labels = await self.event_loop.run_in_executor(None, self._read_track_labels, session)
+        if labels != self._track_labels:
+            self._track_labels = labels
+            self.push_update()
+
+    async def _refresh_track_labels_after_change(self) -> None:
+        """Show the new track once the player has switched, which takes it a moment."""
+        await asyncio.sleep(TRACK_CHANGE_DELAY)
+        await self._refresh_track_labels()
+
+    @property
+    def subtitle_track(self) -> str:
+        """The subtitle track in use, "Off", or "" while nothing (switchable) is playing."""
+        return self._track_labels.get(SUBTITLE_STREAM, "")
+
+    @property
+    def audio_track(self) -> str:
+        """The audio track in use, or "" while nothing (switchable) is playing."""
+        return self._track_labels.get(AUDIO_STREAM, "")
 
     async def async_cycle_subtitles(self, off: bool = False) -> None:
         """
@@ -951,6 +1024,7 @@ class PlexServer(ExternalClientDevice):
             client.setSubtitleStream(target.id if target else 0)
 
         await self.event_loop.run_in_executor(None, cycle)
+        self._create_task(self._refresh_track_labels_after_change())
 
     async def async_cycle_audio(self) -> None:
         """Switch to the next audio track, wrapping round after the last one."""
@@ -965,6 +1039,7 @@ class PlexServer(ExternalClientDevice):
             client.setAudioStream(target.id)
 
         await self.event_loop.run_in_executor(None, cycle)
+        self._create_task(self._refresh_track_labels_after_change())
 
     async def async_mark_watched(self, watched: bool) -> bool:
         """

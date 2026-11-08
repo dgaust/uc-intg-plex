@@ -62,6 +62,9 @@ def device(**kwargs):
     server._session_notification = None
     server._session = None
     server._plex_client = None
+    server._track_labels = {}
+    server._track_cache = None
+    server._background_tasks = set()
     api = PlexApiServer.__new__(PlexApiServer)
     api._baseurl = "http://localhost:32400"
     api._token = "test-token"

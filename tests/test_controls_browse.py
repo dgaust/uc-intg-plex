@@ -43,6 +43,7 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
 
     def playing(self, state):
         current, item = state if state else (None, None)
+        self.server._track_cache = None  # each case stands in for a different item
         self.server.get_session_by_client_id = lambda *_args: current
         self.server._plex.fetchItem = Mock(return_value=item)
         return item
@@ -76,6 +77,33 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await self.server.async_mark_watched(True))
         self.client.setSubtitleStream.assert_not_called()
         self.client.setAudioStream.assert_not_called()
+
+    async def test_track_labels_number_only_repeated_names(self):
+        state = session([1, 2], [5], sub_on=2, audio_on=5)
+        self.playing(state)
+        labels = self.server._read_track_labels(state[0])
+        self.assertEqual(labels, {3: "English (2 of 2)", 2: "English"})
+        self.playing(session([1, 2], [5], audio_on=5))
+        await self.server._refresh_track_labels()
+        self.assertEqual((self.server.subtitle_track, self.server.audio_track), ("Off", "English"))
+        self.server.push_update.assert_called()
+        self.playing(None)
+        await self.server._refresh_track_labels()
+        self.assertEqual((self.server.subtitle_track, self.server.audio_track), ("", ""))
+
+    async def test_sensors_show_the_tracks(self):
+        from sensor import NOT_PLAYING, PlexAudioTrackSensor, PlexSubtitleSensor
+        from ucapi import sensor as uc_sensor
+
+        self.server._track_labels = {3: "English (SDH)"}
+        for cls, expected in ((PlexSubtitleSensor, "English (SDH)"), (PlexAudioTrackSensor, NOT_PLAYING)):
+            entity = cls.__new__(cls)
+            entity._device = self.server
+            entity.update = Mock()
+            await entity.sync_state()
+            sent = entity.update.call_args.args[0]
+            self.assertEqual(sent[uc_sensor.Attributes.VALUE], expected)
+            self.assertEqual(sent[uc_sensor.Attributes.STATE], uc_sensor.States.ON)
 
     async def test_mark_watched_and_unwatched(self):
         item = self.playing(session())
