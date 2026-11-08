@@ -160,5 +160,25 @@ class BrowseTests(unittest.TestCase):
         self.assertEqual((item.can_play, item.can_browse), (False, False))
 
 
+class LiveArtworkTests(unittest.TestCase):
+    def test_live_artwork_url_changes_with_the_programme(self):
+        server = device()
+
+        def airing(title):
+            return SimpleNamespace(
+                type="movie", live=True, title=title, guid=f"tv.plex.xmltv://movie/{title}",
+                thumb="/library/metadata/72088/thumb/1", art=None,
+            )
+
+        first = server.get_artwork_url(airing("BASEketball"))
+        second = server.get_artwork_url(airing("The Retirement Plan"))
+        self.assertNotEqual(first, second)
+        self.assertEqual(first, server.get_artwork_url(airing("BASEketball")))
+        self.assertTrue(first.startswith(server.build_plex_url("/library/metadata/72088/thumb/1") + "&programme="))
+
+        library = SimpleNamespace(type="movie", title="Film", thumb="/t", art=None)
+        self.assertNotIn("programme=", server.get_artwork_url(library))
+
+
 if __name__ == "__main__":
     unittest.main()

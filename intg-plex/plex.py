@@ -5,6 +5,7 @@ This module implements Plex communication of the Remote Two integration driver.
 """
 
 import asyncio
+import hashlib
 import logging
 import time
 from asyncio import AbstractEventLoop
@@ -695,6 +696,15 @@ class PlexServer(ExternalClientDevice):
         url = self._get_artwork_url(item)
         if not url and getattr(self._device_config, "show_placeholders", True):
             return placeholder_image(item)
+        if url and getattr(item, "live", False):
+            # A live session keeps one artwork path for every programme on the channel;
+            # Plex just redirects it to the current poster. The remote (and Plex's image
+            # resizer) cache by URL, so without something programme-specific in it the
+            # first programme's poster stayed up after the next one started.
+            programme = hashlib.sha1(
+                f"{getattr(item, 'guid', '')}|{getattr(item, 'title', '')}".encode()
+            ).hexdigest()[:12]
+            url = f"{url}{'&' if '?' in url else '?'}programme={programme}"
         return url or ""
 
     def build_image_url(self, path: str, size: int) -> str:
